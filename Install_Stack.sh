@@ -19,7 +19,8 @@
 # Ports (official, unmodified):
 #   Timesketch  :80  (nginx)   :443 (nginx HTTPS)
 #   OpenRelik   :8711 (UI)     :8710 (API)
-# Credits: Farah Farho
+# Credits: Farah Farho 
+# linkedin.com/in/farahfarho
 # =============================================================================
 
 set -uo pipefail
