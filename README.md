@@ -90,3 +90,9 @@ Installation output is logged to:
 This repository is licensed under the MIT License. See [LICENSE](LICENSE).
 
 Upstream projects installed by the script are licensed separately. See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
+## Credits
+
+- Maintainer: farah farho (@F-Farho)
+- Project setup/integration script: farah farho
+- Linkedin: https://www.linkedin.com/in/farahfarho/
