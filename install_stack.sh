@@ -202,8 +202,13 @@ resolve_openrelik_release_selection() {
 
 repair_openrelik_deploy_file_if_needed() {
     local local_name="$1"
-    local expected_remote_name="$2"
+    local file_type="$2"
     local local_path="${OR_DIR}/${local_name}"
+    local selected="${OR_SELECTED_RELEASE}"
+    local latest_hint="${OR_TARGET_RELEASE}"
+    local -a candidates=()
+    local -a urls=()
+    local c
 
     if [[ -s "${local_path}" ]] && ! is_http_error_body "${local_path}"; then
         success "${local_name} looks valid."
@@ -212,9 +217,51 @@ repair_openrelik_deploy_file_if_needed() {
 
     warn "${local_name} missing or invalid — attempting recovery..."
 
-    download_first_valid "${local_path}" \
-        "${OR_BASE_DEPLOY_URL}/${expected_remote_name}" \
-        "${OR_BASE_DEPLOY_URL}/${local_name}" \
+    if [[ "${selected}" == "latest" ]]; then
+        selected="latest"
+    fi
+    [[ "${latest_hint}" == "latest" ]] && latest_hint="latest"
+
+    if [[ "${file_type}" == "config" ]]; then
+        candidates+=(
+            "config_${selected}.env"
+            "config-${selected}.env"
+            "config.${selected}.env"
+            "config_${latest_hint}.env"
+            "config-${latest_hint}.env"
+            "config_latest.env"
+            "config-latest.env"
+            "config.env"
+        )
+    elif [[ "${file_type}" == "compose" ]]; then
+        candidates+=(
+            "docker-compose_${selected}.yml"
+            "docker-compose-${selected}.yml"
+            "docker-compose_${selected}.yaml"
+            "docker-compose-${selected}.yaml"
+            "docker-compose_${latest_hint}.yml"
+            "docker-compose-${latest_hint}.yml"
+            "docker-compose_${latest_hint}.yaml"
+            "docker-compose-${latest_hint}.yaml"
+            "docker-compose_latest.yml"
+            "docker-compose-latest.yml"
+            "docker-compose_latest.yaml"
+            "docker-compose-latest.yaml"
+            "docker-compose.yml"
+            "docker-compose.yaml"
+        )
+    else
+        error "Unknown recovery type: ${file_type}"
+    fi
+
+    # Build URL list with de-duplication while preserving order.
+    for c in "${candidates[@]}"; do
+        [[ -z "${c}" ]] && continue
+        [[ " ${urls[*]} " == *" ${OR_BASE_DEPLOY_URL}/${c} "* ]] && continue
+        urls+=("${OR_BASE_DEPLOY_URL}/${c}")
+    done
+
+    download_first_valid "${local_path}" "${urls[@]}" \
         || error "Failed to recover ${local_name}. Check access to raw.githubusercontent.com and upstream OpenRelik deploy filenames."
 }
 
@@ -357,8 +404,8 @@ printf '%s\n' "${OR_RELEASE_CHOICE}" | bash /tmp/openrelik_install.sh 2>&1 | tee
 #   /opt/openrelik/docker-compose.yml
 # If curl inside the installer saved an HTTP error body instead of a real file,
 # repair them here using the release‑aware filenames we derived above.
-repair_openrelik_deploy_file_if_needed "config.env"        "${OR_EXPECTED_CONFIG_FILE}"
-repair_openrelik_deploy_file_if_needed "docker-compose.yml" "${OR_EXPECTED_COMPOSE_FILE}"
+repair_openrelik_deploy_file_if_needed "config.env" "config"
+repair_openrelik_deploy_file_if_needed "docker-compose.yml" "compose"
 
 OR_ADMIN_PASS=$(sed 's/\x1B\[[0-9;]*[mK]//g' "${OR_INSTALL_LOG}" \
     | grep -oP '(?<=Password:\s)\S+' | head -1 || true)
