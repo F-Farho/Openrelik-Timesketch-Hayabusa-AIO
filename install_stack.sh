@@ -217,10 +217,10 @@ repair_openrelik_deploy_file_if_needed() {
     local file_type="$2"
     local local_path="${OR_DIR}/${local_name}"
     local selected="${OR_SELECTED_RELEASE}"
+    local latest_hint="${OR_TARGET_RELEASE}"
     local -a candidates=()
     local -a urls=()
     local c
-    local rc
 
     if [[ -s "${local_path}" ]] && ! is_http_error_body "${local_path}"; then
         success "${local_name} looks valid."
@@ -229,29 +229,39 @@ repair_openrelik_deploy_file_if_needed() {
 
     warn "${local_name} missing or invalid — attempting recovery..."
 
+    if [[ "${selected}" == "latest" ]]; then
+        selected="latest"
+    fi
+    [[ "${latest_hint}" == "latest" ]] && latest_hint="latest"
+
     if [[ "${file_type}" == "config" ]]; then
-        if [[ "${selected}" == "latest" ]]; then
-            candidates+=("config_latest.env" "config-latest.env")
-        else
-            # OpenRelik release files may be published as rc even when menu
-            # shows stable release text (example: config_0.7.0-rc.1.env).
-            for rc in 1 2 3 4 5 6 7 8 9 10; do
-                candidates+=("config_${selected}-rc.${rc}.env" "config-${selected}-rc.${rc}.env")
-            done
-            candidates+=("config_${selected}.env" "config-${selected}.env")
-        fi
-        candidates+=("config.env" "config_latest.env")
+        candidates+=(
+            "config_${selected}.env"
+            "config-${selected}.env"
+            "config.${selected}.env"
+            "config_${latest_hint}.env"
+            "config-${latest_hint}.env"
+            "config_latest.env"
+            "config-latest.env"
+            "config.env"
+        )
     elif [[ "${file_type}" == "compose" ]]; then
-        if [[ "${selected}" == "latest" ]]; then
-            candidates+=("docker-compose_latest.yml" "docker-compose_latest.yaml" "docker-compose-latest.yml" "docker-compose-latest.yaml")
-        else
-            # Match documented rc naming first, then stable names.
-            for rc in 1 2 3 4 5 6 7 8 9 10; do
-                candidates+=("docker-compose_${selected}-rc.${rc}.yml" "docker-compose_${selected}-rc.${rc}.yaml" "docker-compose-${selected}-rc.${rc}.yml" "docker-compose-${selected}-rc.${rc}.yaml")
-            done
-            candidates+=("docker-compose_${selected}.yml" "docker-compose_${selected}.yaml" "docker-compose-${selected}.yml" "docker-compose-${selected}.yaml")
-        fi
-        candidates+=("docker-compose.yml" "docker-compose.yaml" "docker-compose_latest.yml")
+        candidates+=(
+            "docker-compose_${selected}.yml"
+            "docker-compose-${selected}.yml"
+            "docker-compose_${selected}.yaml"
+            "docker-compose-${selected}.yaml"
+            "docker-compose_${latest_hint}.yml"
+            "docker-compose-${latest_hint}.yml"
+            "docker-compose_${latest_hint}.yaml"
+            "docker-compose-${latest_hint}.yaml"
+            "docker-compose_latest.yml"
+            "docker-compose-latest.yml"
+            "docker-compose_latest.yaml"
+            "docker-compose-latest.yaml"
+            "docker-compose.yml"
+            "docker-compose.yaml"
+        )
     else
         error "Unknown recovery type: ${file_type}"
     fi
@@ -263,7 +273,7 @@ repair_openrelik_deploy_file_if_needed() {
         urls+=("${OR_BASE_DEPLOY_URL}/${c}")
     done
 
-    download_first_valid "${local_path}" "${file_type}" "${urls[@]}" \
+    download_first_valid "${local_path}" "${urls[@]}" \
         || error "Failed to recover ${local_name}. Check access to raw.githubusercontent.com and upstream OpenRelik deploy filenames."
 }
 
