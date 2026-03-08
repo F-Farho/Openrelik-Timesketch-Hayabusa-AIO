@@ -133,6 +133,8 @@ is_http_error_body() {
 
 download_first_valid() {
     local dest="$1"; shift
+    local kind="${1:-generic}"
+    shift
     local tmp
 
     for url in "$@"; do
@@ -140,6 +142,16 @@ download_first_valid() {
         log "Trying ${url}"
         if curl -fsSL "${url}" -o "${tmp}"; then
             if ! is_http_error_body "${tmp}"; then
+                if [[ "${kind}" == "config" ]] && grep -qE '=<REPLACE_WITH_[A-Z0-9_]+>' "${tmp}"; then
+                    warn "Rejected ${url}: contains placeholder values."
+                    rm -f "${tmp}"
+                    continue
+                fi
+                if [[ "${kind}" == "compose" ]] && ! grep -qE '^services:' "${tmp}"; then
+                    warn "Rejected ${url}: missing compose services block."
+                    rm -f "${tmp}"
+                    continue
+                fi
                 mv "${tmp}" "${dest}"
                 success "Downloaded valid file to ${dest}"
                 return 0
@@ -461,14 +473,20 @@ done <<< "$(grep -oE '\$\{[A-Z_]+\}' docker-compose.yml | tr -d '${}' | sort -u)
 
 log "Final .env:"
 cat "${ENV_FILE}"
-source "${ENV_FILE}"
+
+if grep -qE '=<REPLACE_WITH_[A-Z0-9_]+>' "${ENV_FILE}"; then
+    error ".env still contains placeholder values (<REPLACE_WITH_...>). OpenRelik deploy file does not match selected release."
+fi
+
+POSTGRES_USER=$(grep -E '^POSTGRES_USER=' "${ENV_FILE}" | tail -1 | cut -d'=' -f2-)
+POSTGRES_DB=$(grep -E '^POSTGRES_DB=' "${ENV_FILE}" | tail -1 | cut -d'=' -f2-)
 
 log "Validating OpenRelik compose schema..."
 docker compose config --quiet && success "OpenRelik compose schema OK."
 
 log "Checking running containers..."
 RUNNING_COUNT=$(docker compose ps --format '{{.State}}' 2>/dev/null \
-    | grep -c 'running' || echo "0")
+    | awk 'BEGIN{c=0} /running/{c++} END{print c+0}')
 log "Running containers: ${RUNNING_COUNT}"
 [[ "${RUNNING_COUNT}" -lt 3 ]] && {
     warn "Fewer than 3 running — starting stack..."
