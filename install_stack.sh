@@ -423,6 +423,7 @@ chmod +x /tmp/deploy_timesketch.sh
 
 log "Patching health-check timeout (300s -> 10s)..."
 sed -i 's/TIMEOUT=300/TIMEOUT=10/' /tmp/deploy_timesketch.sh
+sed -i 's/8GB/4GB/g; s/8g/4g/g; s/8192m/4096m/g' /tmp/deploy_timesketch.sh
 
 log "Running Timesketch installer (creates /opt/timesketch/)..."
 cd /opt
@@ -702,7 +703,15 @@ OR_FLOSS_VER="${OPENRELIK_WORKER_FLOSS_VERSION:-latest}"
 OR_CAPA_VER="${OPENRELIK_WORKER_CAPA_VERSION:-latest}"
 OR_LLM_VER="${OPENRELIK_WORKER_LLM_VERSION:-latest}"
 OR_TS_WORKER_IMG_VER="${OPENRELIK_WORKER_TIMESKETCH_VERSION:-latest}"
-OR_HAYABUSA_VER="${OPENRELIK_WORKER_HAYABUSA_VERSION:-latest}"
+OR_HAYABUSA_LOCAL_TAG="openrelik-worker-hayabusa:local"
+OR_HAYABUSA_REPO="https://github.com/openrelik-contrib/openrelik-worker-hayabusa.git"
+
+# Build hayabusa worker locally from Yamato Security source (ghcr.io requires auth)
+log "Building openrelik-worker-hayabusa from source..."
+rm -rf /tmp/openrelik-worker-hayabusa
+git clone -q --depth=1 "${OR_HAYABUSA_REPO}" /tmp/openrelik-worker-hayabusa
+docker build -q -t "${OR_HAYABUSA_LOCAL_TAG}" /tmp/openrelik-worker-hayabusa     && success "hayabusa image built: ${OR_HAYABUSA_LOCAL_TAG}"     || error "Failed to build hayabusa worker — check /tmp/openrelik-worker-hayabusa"
+rm -rf /tmp/openrelik-worker-hayabusa
 
 # Detect whether openrelik-worker-timesketch is already defined in the base compose.
 # If yes: patch-only (add env vars). If no: define the full service.
@@ -776,7 +785,7 @@ fi
 cat >> "${OVERRIDE_FILE}" << WORKERSEOF
   openrelik-worker-hayabusa:
     container_name: openrelik-worker-hayabusa
-    image: ghcr.io/openrelik/openrelik-worker-hayabusa:${OR_HAYABUSA_VER}
+    image: ${OR_HAYABUSA_LOCAL_TAG}
     restart: always
     environment:
       - REDIS_URL=redis://openrelik-redis:6379
