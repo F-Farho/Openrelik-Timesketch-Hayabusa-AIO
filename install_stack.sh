@@ -131,6 +131,38 @@ is_http_error_body() {
     return 1
 }
 
+# Resolves the actual filename to use for a given base name by checking if the
+# exact file exists upstream. If not, it searches for an RC variant
+# (e.g. config_0.7.0-rc.1.env) and returns that instead.
+resolve_filename() {
+    local base_url="$1"
+    local filename="$2"
+    local status
+
+    status="$(curl -s -o /dev/null -w "%{http_code}" "${base_url}/${filename}" || true)"
+    if [[ "${status}" == "200" ]]; then
+        echo "${filename}"
+        return
+    fi
+
+    local stem="${filename%.*}"
+    local ext=".${filename##*.}"
+    local rc_num
+    local rc_filename
+
+    for rc_num in $(seq 1 9); do
+        rc_filename="${stem}-rc.${rc_num}${ext}"
+        status="$(curl -s -o /dev/null -w "%{http_code}" "${base_url}/${rc_filename}" || true)"
+        if [[ "${status}" == "200" ]]; then
+            echo "${rc_filename}"
+            return
+        fi
+    done
+
+    # No variant found, return original and let normal recovery continue.
+    echo "${filename}"
+}
+
 download_first_valid() {
     local dest="$1"; shift
     local kind="${1:-generic}"
