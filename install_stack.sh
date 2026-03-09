@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Full Stack Installer: Timesketch + OpenRelik 0.7.0
+# Full Stack Installer: Timesketch + OpenRelik 0.7.0 + Hayabusa
 # =============================================================================
 # Run with: sudo bash install_stack.sh
 #
@@ -702,6 +702,7 @@ OR_FLOSS_VER="${OPENRELIK_WORKER_FLOSS_VERSION:-latest}"
 OR_CAPA_VER="${OPENRELIK_WORKER_CAPA_VERSION:-latest}"
 OR_LLM_VER="${OPENRELIK_WORKER_LLM_VERSION:-latest}"
 OR_TS_WORKER_IMG_VER="${OPENRELIK_WORKER_TIMESKETCH_VERSION:-latest}"
+OR_HAYABUSA_VER="${OPENRELIK_WORKER_HAYABUSA_VERSION:-latest}"
 
 # Detect whether openrelik-worker-timesketch is already defined in the base compose.
 # If yes: patch-only (add env vars). If no: define the full service.
@@ -773,6 +774,16 @@ ADDEOF
 fi
 
 cat >> "${OVERRIDE_FILE}" << WORKERSEOF
+  openrelik-worker-hayabusa:
+    container_name: openrelik-worker-hayabusa
+    image: ghcr.io/openrelik/openrelik-worker-hayabusa:${OR_HAYABUSA_VER}
+    restart: always
+    environment:
+      - REDIS_URL=redis://openrelik-redis:6379
+    volumes:
+      - ./data:/usr/share/openrelik/data
+    command: "celery --app=src.app worker --task-events --concurrency=2 --loglevel=INFO -Q openrelik-worker-hayabusa"
+
   openrelik-worker-floss:
     container_name: openrelik-worker-floss
     image: ghcr.io/openrelik/openrelik-worker-floss:${OR_FLOSS_VER}
@@ -815,7 +826,12 @@ cat >> "${OVERRIDE_FILE}" << WORKERSEOF
 
 volumes:
   ollama-data:
+
+networks:
+  timesketch_default:
+    external: true
 WORKERSEOF
+
 
 log "Validating override schema..."
 docker compose \
