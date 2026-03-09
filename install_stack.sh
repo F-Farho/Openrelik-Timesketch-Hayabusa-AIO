@@ -131,8 +131,42 @@ is_http_error_body() {
     return 1
 }
 
+# Resolves the actual filename to use for a given base name by checking if the
+# exact file exists upstream. If not, it searches for an RC variant
+# (e.g. config_0.7.0-rc.1.env) and returns that instead.
+resolve_filename() {
+    local base_url="$1"
+    local filename="$2"
+    local status
+
+    status="$(curl -s -o /dev/null -w "%{http_code}" "${base_url}/${filename}" || true)"
+    if [[ "${status}" == "200" ]]; then
+        echo "${filename}"
+        return
+    fi
+
+    local stem="${filename%.*}"
+    local ext=".${filename##*.}"
+    local rc_num
+    local rc_filename
+
+    for rc_num in $(seq 1 9); do
+        rc_filename="${stem}-rc.${rc_num}${ext}"
+        status="$(curl -s -o /dev/null -w "%{http_code}" "${base_url}/${rc_filename}" || true)"
+        if [[ "${status}" == "200" ]]; then
+            echo "${rc_filename}"
+            return
+        fi
+    done
+
+    # No variant found, return original and let normal recovery continue.
+    echo "${filename}"
+}
+
 download_first_valid() {
     local dest="$1"; shift
+    local kind="${1:-generic}"
+    shift
     local tmp
 
     for url in "$@"; do
@@ -140,6 +174,16 @@ download_first_valid() {
         log "Trying ${url}"
         if curl -fsSL "${url}" -o "${tmp}"; then
             if ! is_http_error_body "${tmp}"; then
+                if [[ "${kind}" == "config" ]] && grep -qE '=<REPLACE_WITH_[A-Z0-9_]+>' "${tmp}"; then
+                    warn "Rejected ${url}: contains placeholder values."
+                    rm -f "${tmp}"
+                    continue
+                fi
+                if [[ "${kind}" == "compose" ]] && ! grep -qE '^services:' "${tmp}"; then
+                    warn "Rejected ${url}: missing compose services block."
+                    rm -f "${tmp}"
+                    continue
+                fi
                 mv "${tmp}" "${dest}"
                 success "Downloaded valid file to ${dest}"
                 return 0
@@ -202,8 +246,15 @@ resolve_openrelik_release_selection() {
 
 repair_openrelik_deploy_file_if_needed() {
     local local_name="$1"
-    local expected_remote_name="$2"
+    local file_type="$2"
     local local_path="${OR_DIR}/${local_name}"
+    local selected="${OR_SELECTED_RELEASE}"
+    local -a candidates=()
+    local -a urls=()
+    local c
+    local rc
+    local resolved_primary=""
+    local expected_file=""
 
     if [[ -s "${local_path}" ]] && ! is_http_error_body "${local_path}"; then
         success "${local_name} looks valid."
@@ -212,9 +263,51 @@ repair_openrelik_deploy_file_if_needed() {
 
     warn "${local_name} missing or invalid — attempting recovery..."
 
-    download_first_valid "${local_path}" \
-        "${OR_BASE_DEPLOY_URL}/${expected_remote_name}" \
-        "${OR_BASE_DEPLOY_URL}/${local_name}" \
+    if [[ "${file_type}" == "config" ]]; then
+        expected_file="${OR_EXPECTED_CONFIG_FILE}"
+    elif [[ "${file_type}" == "compose" ]]; then
+        expected_file="${OR_EXPECTED_COMPOSE_FILE}"
+    fi
+    if [[ -n "${expected_file}" ]]; then
+        resolved_primary="$(resolve_filename "${OR_BASE_DEPLOY_URL}" "${expected_file}")"
+        [[ -n "${resolved_primary}" ]] && candidates+=("${resolved_primary}")
+    fi
+
+    if [[ "${file_type}" == "config" ]]; then
+        if [[ "${selected}" == "latest" ]]; then
+            candidates+=("config_latest.env" "config-latest.env")
+        else
+            # OpenRelik release files may be published as rc even when menu
+            # shows stable release text (example: config_0.7.0-rc.1.env).
+            for rc in 1 2 3 4 5 6 7 8 9 10; do
+                candidates+=("config_${selected}-rc.${rc}.env" "config-${selected}-rc.${rc}.env")
+            done
+            candidates+=("config_${selected}.env" "config-${selected}.env")
+        fi
+        candidates+=("config.env" "config_latest.env")
+    elif [[ "${file_type}" == "compose" ]]; then
+        if [[ "${selected}" == "latest" ]]; then
+            candidates+=("docker-compose_latest.yml" "docker-compose_latest.yaml" "docker-compose-latest.yml" "docker-compose-latest.yaml")
+        else
+            # Match documented rc naming first, then stable names.
+            for rc in 1 2 3 4 5 6 7 8 9 10; do
+                candidates+=("docker-compose_${selected}-rc.${rc}.yml" "docker-compose_${selected}-rc.${rc}.yaml" "docker-compose-${selected}-rc.${rc}.yml" "docker-compose-${selected}-rc.${rc}.yaml")
+            done
+            candidates+=("docker-compose_${selected}.yml" "docker-compose_${selected}.yaml" "docker-compose-${selected}.yml" "docker-compose-${selected}.yaml")
+        fi
+        candidates+=("docker-compose.yml" "docker-compose.yaml" "docker-compose_latest.yml")
+    else
+        error "Unknown recovery type: ${file_type}"
+    fi
+
+    # Build URL list with de-duplication while preserving order.
+    for c in "${candidates[@]}"; do
+        [[ -z "${c}" ]] && continue
+        [[ " ${urls[*]} " == *" ${OR_BASE_DEPLOY_URL}/${c} "* ]] && continue
+        urls+=("${OR_BASE_DEPLOY_URL}/${c}")
+    done
+
+    download_first_valid "${local_path}" "${file_type}" "${urls[@]}" \
         || error "Failed to recover ${local_name}. Check access to raw.githubusercontent.com and upstream OpenRelik deploy filenames."
 }
 
@@ -357,8 +450,8 @@ printf '%s\n' "${OR_RELEASE_CHOICE}" | bash /tmp/openrelik_install.sh 2>&1 | tee
 #   /opt/openrelik/docker-compose.yml
 # If curl inside the installer saved an HTTP error body instead of a real file,
 # repair them here using the release‑aware filenames we derived above.
-repair_openrelik_deploy_file_if_needed "config.env"        "${OR_EXPECTED_CONFIG_FILE}"
-repair_openrelik_deploy_file_if_needed "docker-compose.yml" "${OR_EXPECTED_COMPOSE_FILE}"
+repair_openrelik_deploy_file_if_needed "config.env" "config"
+repair_openrelik_deploy_file_if_needed "docker-compose.yml" "compose"
 
 OR_ADMIN_PASS=$(sed 's/\x1B\[[0-9;]*[mK]//g' "${OR_INSTALL_LOG}" \
     | grep -oP '(?<=Password:\s)\S+' | head -1 || true)
@@ -414,14 +507,20 @@ done <<< "$(grep -oE '\$\{[A-Z_]+\}' docker-compose.yml | tr -d '${}' | sort -u)
 
 log "Final .env:"
 cat "${ENV_FILE}"
-source "${ENV_FILE}"
+
+if grep -qE '=<REPLACE_WITH_[A-Z0-9_]+>' "${ENV_FILE}"; then
+    error ".env still contains placeholder values (<REPLACE_WITH_...>). OpenRelik deploy file does not match selected release."
+fi
+
+POSTGRES_USER=$(grep -E '^POSTGRES_USER=' "${ENV_FILE}" | tail -1 | cut -d'=' -f2-)
+POSTGRES_DB=$(grep -E '^POSTGRES_DB=' "${ENV_FILE}" | tail -1 | cut -d'=' -f2-)
 
 log "Validating OpenRelik compose schema..."
 docker compose config --quiet && success "OpenRelik compose schema OK."
 
 log "Checking running containers..."
 RUNNING_COUNT=$(docker compose ps --format '{{.State}}' 2>/dev/null \
-    | grep -c 'running' || echo "0")
+    | awk 'BEGIN{c=0} /running/{c++} END{print c+0}')
 log "Running containers: ${RUNNING_COUNT}"
 [[ "${RUNNING_COUNT}" -lt 3 ]] && {
     warn "Fewer than 3 running — starting stack..."
