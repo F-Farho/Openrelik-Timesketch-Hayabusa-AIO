@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Full Stack Installer: Timesketch + OpenRelik 0.7.0 + Hayabusa
+# Full Stack Installer: Timesketch + OpenRelik 0.7.0
 # =============================================================================
 # Run with: sudo bash install_stack.sh
 #
 # Design:
 #   - Both installers run from /opt to avoid nested directories
-#       /opt/timesketch/   <- Timesketch compose dir
-#       /opt/openrelik/    <- OpenRelik compose dir
+#       /opt/timesketch/   ← Timesketch compose dir
+#       /opt/openrelik/    ← OpenRelik compose dir
 #   - Official compose files and ports are never modified
 #   - Integration: timesketch-web joins openrelik_default network
-#       -> workers reach Timesketch at http://timesketch-web:5000
-#   - This script assumes the selected OpenRelik release compose already defines
-#     the baseline OpenRelik services/workers it needs.
+#       → workers reach Timesketch at http://timesketch-web:5000
+#   - OpenRelik 0.7.0 ships with these workers out of the box (no build needed):
+#       strings · plaso · timesketch · hayabusa
 #   - docker-compose.override.yml does two things only:
 #       1. Patches openrelik-worker-timesketch with Timesketch credentials
-#       2. Adds extra workers: floss, capa, llm (+ ollama for llm)
+#       2. Adds extra workers: floss · capa · llm (+ ollama for llm)
 #   - Noisy docker output suppressed on screen; full output captured in log
 #
 # Ports (official, unmodified):
@@ -26,7 +26,7 @@
 set -uo pipefail
 
 # -----------------------------------------------------------------------------
-# Logging - screen shows clean progress; log file captures everything
+# Logging — screen shows clean progress; log file captures everything
 # -----------------------------------------------------------------------------
 LOG_FILE="/opt/install_stack_$(date +%Y%m%d_%H%M%S).log"
 mkdir -p /opt
@@ -47,7 +47,7 @@ warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*"; echo "Failed. Log: ${LOG_FILE}"; exit 1; }
 section_desc() { echo -e "${DIM}  $*${NC}"; echo ""; }
 
-# Spinner
+# Spinner — used for long silent operations (docker build)
 SPINNER='/-\|'
 spin_char() { printf '%s' "${SPINNER:$(($1 % 4)):1}"; }
 
@@ -61,332 +61,20 @@ TS_ADMIN_PASS="admin1234"
 OR_ADMIN_USER="admin"
 OR_ADMIN_PASS="changeme"          # overwritten once installer output is captured
 
-TS_DIR="/opt/timesketch"
-OR_DIR="/opt/openrelik"
+TS_DIR="/opt/timesketch"          # created by installer when run from /opt
+OR_DIR="/opt/openrelik"           # created by installer when run from /opt
 
+# The network OpenRelik's installer creates (project name = openrelik)
 OR_NETWORK="openrelik_default"
 
-# OpenRelik release handling
-OR_TARGET_RELEASE="0.7.0"
-OR_RELEASE_CHOICE=""
-OR_SELECTED_RELEASE=""
-OR_EXPECTED_CONFIG_FILE=""
-OR_EXPECTED_COMPOSE_FILE=""
-OR_BASE_DEPLOY_URL="https://raw.githubusercontent.com/openrelik/openrelik-deploy/main/docker"
-
 # =============================================================================
-# Helpers
-# =============================================================================
-wait_for_healthy() {
-    local dir="$1" timeout="${2:-180}" waited=0 tick=0
-    cd "${dir}"
-    until ! docker compose ps 2>/dev/null | grep -qE 'starting|restarting|unhealthy'; do
-        [[ $waited -ge $timeout ]] && { warn "Timeout. State:"; docker compose ps; return 1; }
-        echo -ne "\r  ${waited}s / ${timeout}s  $(spin_char $tick)  "
-        waited=$((waited + 5)); tick=$((tick + 1)); sleep 5
-    done
-    echo ""
-    docker compose ps
-    success "All containers stable."
-}
-
-wait_for_postgres() {
-    local ctr="$1" user="$2" timeout="${3:-60}" waited=0 tick=0
-    log "Waiting for postgres..."
-    until docker exec "${ctr}" pg_isready -U "${user}" -q 2>/dev/null; do
-        [[ $waited -ge $timeout ]] && { warn "Postgres not ready after ${timeout}s."; return 1; }
-        echo -ne "\r  ${waited}s  $(spin_char $tick)  "
-        waited=$((waited + 3)); tick=$((tick + 1)); sleep 3
-    done
-    echo ""
-    success "Postgres is ready."
-}
-
-compose_up() {
-    local desc="$1"; shift
-    local dir="$1";  shift
-    local tick=0
-    log "${desc}..."
-    (
-        cd "${dir}"
-        docker compose "$@" up -d --remove-orphans --quiet-pull < /dev/null
-    ) >> "${LOG_FILE}" 2>&1 &
-    local pid=$!
-    while kill -0 $pid 2>/dev/null; do
-        echo -ne "\r  ${desc}  $(spin_char $tick)  (output in log)"
-        tick=$((tick + 1)); sleep 3
-    done
-    wait $pid
-    local rc=$?
-    echo ""
-    [[ $rc -eq 0 ]] && success "${desc} complete." || { error "${desc} failed - check log: ${LOG_FILE}"; }
-}
-
-is_http_error_body() {
-    local file="$1"
-    [[ ! -s "${file}" ]] && return 0
-    head -5 "${file}" | grep -qiE '^(404|not found|error|<html|<!doctype html)' && return 0
-    return 1
-}
-
-# Patch the OpenRelik install.sh to resolve RC filenames before downloading.
-# This injects a resolve_filename() function and calls it to rewrite
-# CONFIG_ENV_FILE and COMPOSE_FILE before the curl downloads in step [3/8].
-patch_openrelik_installer() {
-    local installer="$1"
-
-    log "Patching OpenRelik installer for RC filename resolution..."
-
-    # The resolve_filename function to inject (written as a literal block)
-    local func
-    func=$(cat << 'FUNCEOF'
-
-# --- RC filename resolver injected by install_stack.sh ---
-resolve_filename() {
-    local base_url="$1"
-    local filename="$2"
-    local http_code
-
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" "${base_url}/${filename}")
-    if [[ "${http_code}" == "200" ]]; then
-        echo "${filename}"
-        return
-    fi
-
-    local stem="${filename%.*}"
-    local ext=".${filename##*.}"
-    local rc_num rc_filename
-
-    for rc_num in 1 2 3 4 5 6 7 8 9; do
-        rc_filename="${stem}-rc.${rc_num}${ext}"
-        http_code=$(curl -s -o /dev/null -w "%{http_code}" "${base_url}/${rc_filename}")
-        if [[ "${http_code}" == "200" ]]; then
-            echo "${rc_filename}"
-            return
-        fi
-    done
-
-    echo "${filename}"
-}
-# --- end injected resolver ---
-
-FUNCEOF
-)
-
-    # Find the line number of the BASE_DEPLOY_URL assignment so we can insert
-    # the function right after it (it must be defined before the curl block).
-    local insert_line
-    insert_line=$(grep -n 'BASE_DEPLOY_URL=' "${installer}" | head -1 | cut -d: -f1)
-
-    if [[ -z "${insert_line}" ]]; then
-        warn "Could not find BASE_DEPLOY_URL in installer - skipping patch."
-        return
-    fi
-
-    # Insert the function block after the BASE_DEPLOY_URL line.
-    # Use python for reliable multi-line insertion without temp file races.
-    python3 - "${installer}" "${insert_line}" "${func}" << 'PYEOF'
-import sys
-
-path      = sys.argv[1]
-after_ln  = int(sys.argv[2])
-injection = sys.argv[3]
-
-lines = open(path).readlines()
-lines.insert(after_ln, injection + "\n")
-open(path, 'w').writelines(lines)
-PYEOF
-
-    # Now find the curl block that downloads config.env and docker-compose.yml
-    # (step [3/8]) and insert the resolve calls just before it.
-    # We look for the first `curl -s ${BASE_DEPLOY_URL}/${CONFIG_ENV_FILE}` line.
-    local curl_line
-    curl_line=$(grep -n 'curl.*CONFIG_ENV_FILE' "${installer}" | head -1 | cut -d: -f1)
-
-    if [[ -z "${curl_line}" ]]; then
-        warn "Could not find CONFIG_ENV_FILE curl line - skipping resolve injection."
-        return
-    fi
-
-    local resolve_calls
-    resolve_calls=$(cat << 'RESOLVEEOF'
-
-# Resolve actual filenames - fall back to RC variants if exact files don't exist
-CONFIG_ENV_FILE="$(resolve_filename "${BASE_DEPLOY_URL}" "${CONFIG_ENV_FILE}")"
-COMPOSE_FILE="$(resolve_filename "${BASE_DEPLOY_URL}" "${COMPOSE_FILE}")"
-
-RESOLVEEOF
-)
-
-    python3 - "${installer}" "${curl_line}" "${resolve_calls}" << 'PYEOF'
-import sys
-
-path      = sys.argv[1]
-after_ln  = int(sys.argv[2]) - 1   # insert BEFORE the curl line (0-indexed)
-injection = sys.argv[3]
-
-lines = open(path).readlines()
-lines.insert(after_ln, injection + "\n")
-open(path, 'w').writelines(lines)
-PYEOF
-
-    # Strip any carriage returns that may have crept in
-    python3 -c "
-data = open('${installer}', 'rb').read()
-fixed = data.replace(b'\r\n', b'\n').replace(b'\r', b'\n')
-open('${installer}', 'wb').write(fixed)
-"
-    success "Installer patched successfully."
-}
-
-resolve_openrelik_release_selection() {
-    local install_src="$1"
-    local latest_release releases_blob release
-    local other_idx=0
-
-    latest_release="$(grep -oP 'LATEST_RELEASE="\K[^"]+' "${install_src}" | head -1 || true)"
-    [[ -z "${latest_release}" ]] && latest_release="0.7.0"
-
-    if [[ "${OR_TARGET_RELEASE}" == "latest" ]]; then
-        OR_RELEASE_CHOICE="2"
-        OR_SELECTED_RELEASE="latest"
-    elif [[ "${OR_TARGET_RELEASE}" == "${latest_release}" ]]; then
-        OR_RELEASE_CHOICE="1"
-        OR_SELECTED_RELEASE="${latest_release}"
-    else
-        releases_blob="$(grep -oP 'RELEASES=\(\K[^)]+' "${install_src}" | head -1 || true)"
-        if [[ -n "${releases_blob}" ]]; then
-            while read -r release; do
-                [[ -z "${release}" ]] && continue
-                [[ "${release}" == "${latest_release}" ]] && continue
-                other_idx=$((other_idx + 1))
-                if [[ "${release}" == "${OR_TARGET_RELEASE}" ]]; then
-                    OR_RELEASE_CHOICE="$((other_idx + 2))"
-                    OR_SELECTED_RELEASE="${release}"
-                    break
-                fi
-            done < <(printf '%s\n' "${releases_blob}" | grep -oE '"[^"]+"' | tr -d '"')
-        fi
-    fi
-
-    [[ -z "${OR_SELECTED_RELEASE}" ]] && error "Target OpenRelik release ${OR_TARGET_RELEASE} not found in installer menu."
-
-    if [[ "${OR_SELECTED_RELEASE}" == "latest" ]]; then
-        OR_EXPECTED_CONFIG_FILE="config_latest.env"
-        OR_EXPECTED_COMPOSE_FILE="docker-compose_latest.yml"
-    else
-        OR_EXPECTED_CONFIG_FILE="config_${OR_SELECTED_RELEASE}.env"
-        OR_EXPECTED_COMPOSE_FILE="docker-compose_${OR_SELECTED_RELEASE}.yml"
-    fi
-
-    log "Target OpenRelik release: ${OR_SELECTED_RELEASE}"
-    log "Installer menu choice:     ${OR_RELEASE_CHOICE}"
-    log "Expected config file:      ${OR_EXPECTED_CONFIG_FILE}"
-    log "Expected compose file:     ${OR_EXPECTED_COMPOSE_FILE}"
-}
-
-download_first_valid() {
-    local dest="$1"; shift
-    local kind="${1:-generic}"
-    shift
-    local tmp
-
-    for url in "$@"; do
-        tmp="$(mktemp)"
-        log "Trying ${url}"
-        if curl -fsSL "${url}" -o "${tmp}"; then
-            if ! is_http_error_body "${tmp}"; then
-                if [[ "${kind}" == "config" ]] && grep -qE '=<REPLACE_WITH_[A-Z0-9_]+>' "${tmp}"; then
-                    warn "Rejected ${url}: contains placeholder values."
-                    rm -f "${tmp}"
-                    continue
-                fi
-                if [[ "${kind}" == "compose" ]] && ! grep -qE '^services:' "${tmp}"; then
-                    warn "Rejected ${url}: missing compose services block."
-                    rm -f "${tmp}"
-                    continue
-                fi
-                mv "${tmp}" "${dest}"
-                success "Downloaded valid file to ${dest}"
-                return 0
-            fi
-            warn "Downloaded body from ${url} looked invalid."
-        else
-            warn "Download failed: ${url}"
-        fi
-        rm -f "${tmp}"
-    done
-
-    return 1
-}
-
-repair_openrelik_deploy_file_if_needed() {
-    local local_name="$1"
-    local file_type="$2"
-    local local_path="${OR_DIR}/${local_name}"
-    local selected="${OR_SELECTED_RELEASE}"
-    local latest_hint="${OR_TARGET_RELEASE}"
-    local -a candidates=()
-    local -a urls=()
-    local c
-
-    if [[ -s "${local_path}" ]] && ! is_http_error_body "${local_path}"; then
-        success "${local_name} looks valid."
-        return 0
-    fi
-
-    warn "${local_name} missing or invalid - attempting recovery..."
-
-    if [[ "${file_type}" == "config" ]]; then
-        candidates+=(
-            "config_${selected}.env"
-            "config-${selected}.env"
-            "config.${selected}.env"
-            "config_${latest_hint}.env"
-            "config-${latest_hint}.env"
-            "config_latest.env"
-            "config-latest.env"
-            "config.env"
-        )
-    elif [[ "${file_type}" == "compose" ]]; then
-        candidates+=(
-            "docker-compose_${selected}.yml"
-            "docker-compose-${selected}.yml"
-            "docker-compose_${selected}.yaml"
-            "docker-compose-${selected}.yaml"
-            "docker-compose_${latest_hint}.yml"
-            "docker-compose-${latest_hint}.yml"
-            "docker-compose_${latest_hint}.yaml"
-            "docker-compose-${latest_hint}.yaml"
-            "docker-compose_latest.yml"
-            "docker-compose-latest.yml"
-            "docker-compose_latest.yaml"
-            "docker-compose-latest.yaml"
-            "docker-compose.yml"
-            "docker-compose.yaml"
-        )
-    else
-        error "Unknown recovery type: ${file_type}"
-    fi
-
-    for c in "${candidates[@]}"; do
-        [[ -z "${c}" ]] && continue
-        [[ " ${urls[*]} " == *" ${OR_BASE_DEPLOY_URL}/${c} "* ]] && continue
-        urls+=("${OR_BASE_DEPLOY_URL}/${c}")
-    done
-
-    download_first_valid "${local_path}" "${file_type}" "${urls[@]}" \
-        || error "Failed to recover ${local_name}. Check access to raw.githubusercontent.com and upstream OpenRelik deploy filenames."
-}
-
-# =============================================================================
-# SECTION 1 - Cleanup
+# SECTION 1 — Cleanup
 # =============================================================================
 echo ""
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-echo -e "${CYAN}${BOLD} SECTION 1 - Cleanup${NC}"
+echo -e "${CYAN}${BOLD} SECTION 1 — Cleanup${NC}"
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-section_desc "Stop all containers, prune volumes + networks, remove old dirs + Docker cache"
+section_desc "Stop all containers · prune volumes + networks · remove old dirs + Docker cache"
 
 log "Stopping and removing all containers..."
 docker ps -aq | xargs -r docker stop  2>/dev/null || true
@@ -408,23 +96,24 @@ docker system prune -af --volumes
 success "Cleanup complete."
 
 # =============================================================================
-# SECTION 2 - Install Timesketch
+# SECTION 2 — Install Timesketch
 # =============================================================================
 echo ""
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-echo -e "${CYAN}${BOLD} SECTION 2 - Install Timesketch${NC}"
+echo -e "${CYAN}${BOLD} SECTION 2 — Install Timesketch${NC}"
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-section_desc "Download installer, patch health-check timeout, run from /opt, create data dirs, start stack"
+section_desc "Download installer · patch health-check timeout · run from /opt · create data dirs · start stack"
 
 log "Downloading Timesketch installer..."
 curl -fsSL -o /tmp/deploy_timesketch.sh \
     https://raw.githubusercontent.com/google/timesketch/master/contrib/deploy_timesketch.sh
 chmod +x /tmp/deploy_timesketch.sh
 
-log "Patching health-check timeout (300s -> 10s)..."
+log "Patching health-check timeout (300s → 10s)..."
 sed -i 's/TIMEOUT=300/TIMEOUT=10/' /tmp/deploy_timesketch.sh
-sed -i 's/8GB/4GB/g; s/8g/4g/g; s/8192m/4096m/g' /tmp/deploy_timesketch.sh
 
+# Run from /opt → installer creates /opt/timesketch/ (no nesting)
+# "n" = do not start containers yet (we start after pre-creating dirs)
 log "Running Timesketch installer (creates /opt/timesketch/)..."
 cd /opt
 echo "n" | bash /tmp/deploy_timesketch.sh
@@ -448,34 +137,84 @@ log "Validating compose schema..."
 docker compose config --quiet \
     && success "Timesketch compose schema OK."
 
+wait_for_healthy() {
+    local dir="$1" timeout="${2:-180}" waited=0 tick=0
+    cd "${dir}"
+    until ! docker compose ps 2>/dev/null | grep -qE 'starting|restarting|unhealthy'; do
+        [[ $waited -ge $timeout ]] && { warn "Timeout. State:"; docker compose ps; return 1; }
+        echo -ne "\r  ${waited}s / ${timeout}s  $(spin_char $tick)  "
+        waited=$((waited + 5)); tick=$((tick + 1)); sleep 5
+    done
+    echo ""; docker compose ps; success "All containers stable."
+}
+
+wait_for_postgres() {
+    local ctr="$1" user="$2" timeout="${3:-60}" waited=0 tick=0
+    log "Waiting for postgres..."
+    until docker exec "${ctr}" pg_isready -U "${user}" -q 2>/dev/null; do
+        [[ $waited -ge $timeout ]] && { warn "Postgres not ready after ${timeout}s."; return 1; }
+        echo -ne "\r  ${waited}s  $(spin_char $tick)  "
+        waited=$((waited + 3)); tick=$((tick + 1)); sleep 3
+    done
+    echo ""; success "Postgres is ready."
+}
+
+# compose_up: run docker compose up silently on screen (full output in log)
+# Usage: compose_up "Description" [compose dir] [extra flags...]
+# All docker compose up calls use this helper so:
+#   - Screen shows a clean spinner line only
+#   - Log file captures everything
+#   - stdin is /dev/null → interactive volume-recreation prompts auto-answer N
+compose_up() {
+    local desc="$1"; shift
+    local dir="$1";  shift   # compose dir (cd into it)
+    local tick=0
+    log "${desc}..."
+    (
+        cd "${dir}"
+        # stdin from /dev/null → auto-answers "N" to any interactive prompts
+        # (e.g. "Volume X exists but doesn't match configuration. Recreate?")
+        docker compose "$@" up -d --remove-orphans --quiet-pull < /dev/null
+    ) >> "${LOG_FILE}" 2>&1 &
+    local pid=$!
+    while kill -0 $pid 2>/dev/null; do
+        echo -ne "\r  ${desc}  $(spin_char $tick)  (output in log)"
+        tick=$((tick + 1)); sleep 3
+    done
+    wait $pid
+    local rc=$?
+    echo ""
+    [[ $rc -eq 0 ]] && success "${desc} complete." || { error "${desc} failed — check log: ${LOG_FILE}"; }
+}
+
 compose_up "Starting Timesketch" "${TS_DIR}"
 log "Waiting for Timesketch containers to stabilise..."
 wait_for_healthy "${TS_DIR}" 180
 success "Timesketch stack running."
 
 # =============================================================================
-# SECTION 3 - Verify Timesketch + Create Admin
+# SECTION 3 — Verify Timesketch + Create Admin
 # =============================================================================
 echo ""
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-echo -e "${CYAN}${BOLD} SECTION 3 - Verify Timesketch + Create Admin${NC}"
+echo -e "${CYAN}${BOLD} SECTION 3 — Verify Timesketch + Create Admin${NC}"
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-section_desc "Wait for nginx on :80, create admin user (${TS_ADMIN_USER} / ${TS_ADMIN_PASS})"
+section_desc "Wait for nginx on :80 · create admin user (${TS_ADMIN_USER} / ${TS_ADMIN_PASS})"
 
 cd "${TS_DIR}"
 
 log "Waiting for Timesketch on port 80 (up to 120s)..."
 WAIT_SECS=0; TICK=0; TS_HTTP="000"
 until [[ "$TS_HTTP" =~ ^(200|302)$ ]]; do
-    [[ $WAIT_SECS -ge 120 ]] && { warn "Not reachable after 120s (HTTP ${TS_HTTP}) - continuing."; break; }
-    echo -ne "\r  ${WAIT_SECS}s - HTTP ${TS_HTTP}  $(spin_char $TICK)  "
+    [[ $WAIT_SECS -ge 120 ]] && { warn "Not reachable after 120s (HTTP ${TS_HTTP}) — continuing."; break; }
+    echo -ne "\r  ${WAIT_SECS}s — HTTP ${TS_HTTP}  $(spin_char $TICK)  "
     sleep 5; WAIT_SECS=$((WAIT_SECS + 5)); TICK=$((TICK + 1))
     TS_HTTP=$(curl -s -o /dev/null -w "%{http_code}" http://localhost 2>/dev/null || echo "000")
 done
 echo ""
 [[ "$TS_HTTP" =~ ^(200|302)$ ]] \
     && success "Timesketch reachable on :80 (HTTP ${TS_HTTP})." \
-    || warn "Timesketch HTTP ${TS_HTTP} - still initialising."
+    || warn "Timesketch HTTP ${TS_HTTP} — still initialising."
 
 log "Detecting Timesketch web container..."
 TS_WEB=$(docker ps --format '{{.Names}}' \
@@ -487,19 +226,20 @@ log "Creating Timesketch admin user..."
 docker exec "${TS_WEB}" tsctl create-user "${TS_ADMIN_USER}" \
     --password "${TS_ADMIN_PASS}" \
     && success "Admin user created." \
-    || warn "Admin may already exist - continuing."
+    || warn "Admin may already exist — continuing."
 
 success "Timesketch ready."
 
 # =============================================================================
-# SECTION 4 - Install OpenRelik
+# SECTION 4 — Install OpenRelik
 # =============================================================================
 echo ""
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-echo -e "${CYAN}${BOLD} SECTION 4 - Install OpenRelik${NC}"
+echo -e "${CYAN}${BOLD} SECTION 4 — Install OpenRelik${NC}"
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-section_desc "Download installer, patch it for RC filename resolution, derive correct menu choice, run from /opt, capture generated password"
+section_desc "Download installer · run from /opt (creates /opt/openrelik/) · validate config files · capture generated password"
 
+# Run from /opt → installer creates /opt/openrelik/ (no nesting)
 cd /opt
 
 log "Downloading OpenRelik installer..."
@@ -507,36 +247,37 @@ curl -fsSL -o /tmp/openrelik_install.sh \
     https://raw.githubusercontent.com/openrelik/openrelik-deploy/main/docker/install.sh
 chmod +x /tmp/openrelik_install.sh
 
-# Strip carriage returns from upstream installer before doing anything else
-python3 -c "
-data = open('/tmp/openrelik_install.sh', 'rb').read()
-fixed = data.replace(b'\r\n', b'\n').replace(b'\r', b'\n')
-open('/tmp/openrelik_install.sh', 'wb').write(fixed)
-"
-
-# Derive the correct menu choice from the installer's own version list
-resolve_openrelik_release_selection "/tmp/openrelik_install.sh"
-
-# Patch the installer so it resolves RC filenames internally before downloading.
-# This is the key step: resolve_filename must run INSIDE the subprocess, not here.
-patch_openrelik_installer "/tmp/openrelik_install.sh"
-
 OR_INSTALL_LOG="/tmp/openrelik_install_$$.log"
-log "Running OpenRelik installer - Docker pull progress below..."
-printf '%s\n' "${OR_RELEASE_CHOICE}" | bash /tmp/openrelik_install.sh 2>&1 | tee "${OR_INSTALL_LOG}" \
-    || warn "Installer exited non-zero - checking state."
+log "Running OpenRelik installer — Docker pull progress below..."
+# NOTE: The current installer has no menu prompt — do NOT pipe stdin.
+# Piping input to it reaches docker compose subprocesses inside the installer,
+# corrupting interactive prompts and causing curl to save 404 bodies as config files.
+bash /tmp/openrelik_install.sh 2>&1 | tee "${OR_INSTALL_LOG}" \
+    || warn "Installer exited non-zero — checking state."
 
-# Safety net: if the patched installer still downloaded a bad file, recover here
-repair_openrelik_deploy_file_if_needed "config.env" "config"
-repair_openrelik_deploy_file_if_needed "docker-compose.yml" "compose"
+# ---- Validate downloaded config files ----------------------------------------
+# The installer uses curl -s (no -f), which silently saves HTTP error bodies as
+# files if raw.githubusercontent.com is unreachable or the path has changed.
+# Catch that here before any compose operation touches the files.
+for _fname in docker-compose.yml config.env; do
+    _fpath="${OR_DIR}/${_fname}"
+    if [[ -f "${_fpath}" ]] && head -1 "${_fpath}" | grep -qiE '^(404|not found|error|<html)'; then
+        warn "${_fname} contains an HTTP error body — re-downloading..."
+        _BASE="https://raw.githubusercontent.com/openrelik/openrelik-deploy/main/docker"
+        curl -fsSL "${_BASE}/${_fname}" -o "${_fpath}" \
+            && success "${_fname} re-downloaded OK." \
+            || error "Failed to re-download ${_fname} — check network access to raw.githubusercontent.com."
+    fi
+done
 
+# Strip ANSI codes before grepping for password
 OR_ADMIN_PASS=$(sed 's/\x1B\[[0-9;]*[mK]//g' "${OR_INSTALL_LOG}" \
     | grep -oP '(?<=Password:\s)\S+' | head -1 || true)
 
 if [[ -n "${OR_ADMIN_PASS}" ]]; then
     success "Captured installer-generated admin password."
 else
-    warn "Could not extract password - generating fallback."
+    warn "Could not extract password — generating fallback."
     OR_ADMIN_PASS="$(openssl rand -base64 12 | tr -d '=+/')"
     warn "Fallback password: ${OR_ADMIN_PASS} (you may need to reset manually)"
 fi
@@ -544,23 +285,24 @@ fi
 success "OpenRelik installer complete."
 
 # =============================================================================
-# SECTION 5 - Locate .env + Verify OpenRelik Stack
+# SECTION 5 — Locate .env + Verify OpenRelik Stack
 # =============================================================================
 echo ""
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-echo -e "${CYAN}${BOLD} SECTION 5 - Locate .env + Verify OpenRelik Stack${NC}"
+echo -e "${CYAN}${BOLD} SECTION 5 — Locate .env + Verify OpenRelik Stack${NC}"
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-section_desc "Find .env, validate schema, ensure stack healthy, verify postgres and DB migrations"
+section_desc "Find .env · validate schema · ensure stack healthy · verify postgres and DB migrations"
 
 log "Locating .env..."
 ENV_FILE=$(find "${OR_DIR}" -maxdepth 3 -name ".env" \
     -not -path "*/.git/*" 2>/dev/null | head -1 || true)
 
 if [[ -z "${ENV_FILE}" ]]; then
+    # Fallback: check running server container's working dir
     OR_CWD=$(docker inspect openrelik-server \
         --format '{{.Config.WorkingDir}}' 2>/dev/null || true)
     [[ -n "${OR_CWD}" ]] && log "Server working dir hint: ${OR_CWD}"
-    error ".env not found under ${OR_DIR} - installer may have failed."
+    error ".env not found under ${OR_DIR} — installer may have failed."
 fi
 
 OR_COMPOSE_DIR=$(dirname "${ENV_FILE}")
@@ -575,7 +317,7 @@ log "Checking .env completeness..."
 while IFS= read -r VAR; do
     [[ -z "$VAR" ]] && continue
     grep -q "^${VAR}=" "${ENV_FILE}" && continue
-    warn "${VAR} missing - adding default."
+    warn "${VAR} missing — adding default."
     case "$VAR" in
         POSTGRES_DATA_PATH) echo "${VAR}=${OR_COMPOSE_DIR}/postgres-data" >> "${ENV_FILE}" ;;
         *)                  echo "${VAR}=latest" >> "${ENV_FILE}" ;;
@@ -584,23 +326,17 @@ done <<< "$(grep -oE '\$\{[A-Z_]+\}' docker-compose.yml | tr -d '${}' | sort -u)
 
 log "Final .env:"
 cat "${ENV_FILE}"
-
-if grep -qE '=<REPLACE_WITH_[A-Z0-9_]+>' "${ENV_FILE}"; then
-    error ".env still contains placeholder values (<REPLACE_WITH_...>). OpenRelik deploy file does not match selected release."
-fi
-
-POSTGRES_USER=$(grep -E '^POSTGRES_USER=' "${ENV_FILE}" | tail -1 | cut -d'=' -f2-)
-POSTGRES_DB=$(grep -E '^POSTGRES_DB=' "${ENV_FILE}" | tail -1 | cut -d'=' -f2-)
+source "${ENV_FILE}"
 
 log "Validating OpenRelik compose schema..."
 docker compose config --quiet && success "OpenRelik compose schema OK."
 
 log "Checking running containers..."
 RUNNING_COUNT=$(docker compose ps --format '{{.State}}' 2>/dev/null \
-    | awk 'BEGIN{c=0} /running/{c++} END{print c+0}')
+    | grep -c 'running' || echo "0")
 log "Running containers: ${RUNNING_COUNT}"
 [[ "${RUNNING_COUNT}" -lt 3 ]] && {
-    warn "Fewer than 3 running - starting stack..."
+    warn "Fewer than 3 running — starting stack..."
     compose_up "Starting OpenRelik" "${OR_COMPOSE_DIR}"
 }
 
@@ -623,11 +359,11 @@ docker exec "${OR_PG}" psql \
 success "OpenRelik stack verified."
 
 # =============================================================================
-# SECTION 6 - Confirm OpenRelik Admin
+# SECTION 6 — Confirm OpenRelik Admin
 # =============================================================================
 echo ""
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-echo -e "${CYAN}${BOLD} SECTION 6 - Confirm OpenRelik Admin${NC}"
+echo -e "${CYAN}${BOLD} SECTION 6 — Confirm OpenRelik Admin${NC}"
 echo -e "${CYAN}${BOLD}======================================================${NC}"
 section_desc "Verify admin login via POST /api/v1/auth/login on :8710"
 
@@ -640,28 +376,33 @@ OR_LOGIN=$(curl -s -o /dev/null -w "%{http_code}" \
 log "Login HTTP: ${OR_LOGIN}"
 [[ "$OR_LOGIN" == "200" ]] \
     && success "OpenRelik admin login verified." \
-    || warn "Login returned ${OR_LOGIN} - check credentials in installer output above."
+    || warn "Login returned ${OR_LOGIN} — check credentials in installer output above."
 
 success "OpenRelik ready."
 
 # =============================================================================
-# SECTION 7 - Network Integration
+# SECTION 7 — Network Integration
 # =============================================================================
 echo ""
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-echo -e "${CYAN}${BOLD} SECTION 7 - Network Integration${NC}"
+echo -e "${CYAN}${BOLD} SECTION 7 — Network Integration${NC}"
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-section_desc "Connect timesketch-web to ${OR_NETWORK}, write Timesketch override for reboot persistence"
+section_desc "Connect timesketch-web to ${OR_NETWORK} · write Timesketch override for reboot persistence"
 
+# Connect timesketch-web to OpenRelik's internal network so all OpenRelik
+# containers can reach it at http://timesketch-web:5000 via Docker DNS.
 log "Connecting timesketch-web to ${OR_NETWORK}..."
 if docker network inspect "${OR_NETWORK}" &>/dev/null; then
     docker network connect "${OR_NETWORK}" timesketch-web 2>/dev/null \
         && success "timesketch-web connected to ${OR_NETWORK}." \
         || log "timesketch-web already on ${OR_NETWORK}."
 else
-    warn "${OR_NETWORK} not found - OpenRelik may not be running yet."
+    warn "${OR_NETWORK} not found — OpenRelik may not be running yet."
 fi
 
+# Write a Timesketch override that makes this connection permanent.
+# On every `docker compose up -d`, timesketch-web will automatically
+# rejoin openrelik_default without needing a manual docker network connect.
 log "Writing Timesketch override for network persistence..."
 cat > "${TS_DIR}/docker-compose.override.yml" << YAMLEOF
 # Auto-generated by install_stack.sh
@@ -684,73 +425,56 @@ docker compose \
     -f "${TS_DIR}/docker-compose.override.yml" \
     config --quiet \
     && success "Timesketch override schema OK." \
-    || warn "Override validation warning - check schema above."
+    || warn "Override validation warning — check schema above."
 
 success "Network integration complete."
 
 # =============================================================================
-# SECTION 8 - OpenRelik Compose Override (patch + extra workers)
+# SECTION 8 — OpenRelik Compose Override (patch + extra workers)
 # =============================================================================
 echo ""
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-echo -e "${CYAN}${BOLD} SECTION 8 - OpenRelik Worker Override${NC}"
+echo -e "${CYAN}${BOLD} SECTION 8 — OpenRelik Worker Override${NC}"
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-section_desc "Patch openrelik-worker-timesketch with TS credentials, add floss, capa, llm + ollama"
+section_desc "Patch openrelik-worker-timesketch with TS credentials · add floss · capa · llm + ollama"
 
 cd "${OR_COMPOSE_DIR}"
 
+# OpenRelik 0.7.0 ships these workers in the default docker-compose.yml — no need to add them:
+#   openrelik-worker-strings · openrelik-worker-plaso
+#   openrelik-worker-timesketch · openrelik-worker-hayabusa
+#
+# The override does two things only:
+#   1. Patches openrelik-worker-timesketch with Timesketch connection env vars
+#      (the default compose defines the service but leaves credentials blank)
+#   2. Adds the three extra workers: floss, capa, llm
+#      plus openrelik-ollama as the LLM backend for the llm worker.
+#
+# Version variables fall back to 'latest' if not present in .env.
 OR_FLOSS_VER="${OPENRELIK_WORKER_FLOSS_VERSION:-latest}"
 OR_CAPA_VER="${OPENRELIK_WORKER_CAPA_VERSION:-latest}"
 OR_LLM_VER="${OPENRELIK_WORKER_LLM_VERSION:-latest}"
-OR_TS_WORKER_IMG_VER="${OPENRELIK_WORKER_TIMESKETCH_VERSION:-latest}"
-OR_HAYABUSA_LOCAL_TAG="openrelik-worker-hayabusa:local"
-OR_HAYABUSA_REPO="https://github.com/openrelik-contrib/openrelik-worker-hayabusa.git"
-
-# Build hayabusa worker locally from Yamato Security source (ghcr.io requires auth)
-log "Building openrelik-worker-hayabusa from source..."
-rm -rf /tmp/openrelik-worker-hayabusa
-git clone -q --depth=1 "${OR_HAYABUSA_REPO}" /tmp/openrelik-worker-hayabusa
-docker build -q -t "${OR_HAYABUSA_LOCAL_TAG}" /tmp/openrelik-worker-hayabusa     && success "hayabusa image built: ${OR_HAYABUSA_LOCAL_TAG}"     || error "Failed to build hayabusa worker — check /tmp/openrelik-worker-hayabusa"
-rm -rf /tmp/openrelik-worker-hayabusa
-
-# Detect whether openrelik-worker-timesketch is already defined in the base compose.
-# If yes: patch-only (add env vars). If no: define the full service.
-if grep -q 'openrelik-worker-timesketch' "${OR_COMPOSE_DIR}/docker-compose.yml" 2>/dev/null; then
-    TS_WORKER_IN_BASE=true
-    log "openrelik-worker-timesketch found in base compose - will patch credentials only."
-else
-    TS_WORKER_IN_BASE=false
-    log "openrelik-worker-timesketch NOT in base compose - will add as new full service."
-fi
 
 log "Writing ${OR_COMPOSE_DIR}/docker-compose.override.yml..."
-
-# Build the override file in parts so bash variables expand correctly
-# and heredoc quoting stays clean regardless of service presence.
-OVERRIDE_FILE="${OR_COMPOSE_DIR}/docker-compose.override.yml"
-
-cat > "${OVERRIDE_FILE}" << HEADEREOF
+cat > "${OR_COMPOSE_DIR}/docker-compose.override.yml" << YAMLEOF
 # Auto-generated by install_stack.sh
 #
-# 1. Configures openrelik-worker-timesketch with Timesketch credentials.
-#    Adds as a new full service if the base compose does not define it.
+# 1. Patches openrelik-worker-timesketch with Timesketch credentials.
+#    The 0.7.0 default compose defines the service but ships no credentials;
+#    this override merges the required env vars without replacing the service.
 #
 # 2. Adds extra workers:
-#    openrelik-worker-floss  - FLARE Obfuscated String Solver
-#    openrelik-worker-capa   - capability detection for executables
-#    openrelik-worker-llm    - prompt-driven file analysis via Ollama
-#    openrelik-ollama        - Ollama backend for the llm worker
+#    openrelik-worker-floss  — FLARE Obfuscated String Solver (malware strings)
+#    openrelik-worker-capa   — detects capabilities in executables (ATT&CK mapping)
+#    openrelik-worker-llm    — runs user-defined prompts on files via Ollama
+#    openrelik-ollama        — Ollama LLM backend (required by llm worker)
 #
-# NOTE: Pull an Ollama model before using the llm worker:
+# NOTE: After install, pull an Ollama model before using the llm worker:
 #   docker exec openrelik-ollama ollama pull llama3
 
 services:
 
-HEADEREOF
-
-if [[ "${TS_WORKER_IN_BASE}" == "true" ]]; then
-    # Patch mode: only inject env vars into existing service definition
-    cat >> "${OVERRIDE_FILE}" << PATCHEOF
+  # ── Patch existing timesketch worker with credentials ──────────────────────
   openrelik-worker-timesketch:
     environment:
       - TIMESKETCH_SERVER_URL=http://timesketch-web:5000
@@ -758,41 +482,7 @@ if [[ "${TS_WORKER_IN_BASE}" == "true" ]]; then
       - TIMESKETCH_USERNAME=${TS_ADMIN_USER}
       - TIMESKETCH_PASSWORD=${TS_ADMIN_PASS}
 
-PATCHEOF
-else
-    # Add mode: define the complete service since it is absent from base compose
-    cat >> "${OVERRIDE_FILE}" << ADDEOF
-  openrelik-worker-timesketch:
-    container_name: openrelik-worker-timesketch
-    image: ghcr.io/openrelik/openrelik-worker-timesketch:${OR_TS_WORKER_IMG_VER}
-    restart: always
-    environment:
-      - REDIS_URL=redis://openrelik-redis:6379
-      - TIMESKETCH_SERVER_URL=http://timesketch-web:5000
-      - TIMESKETCH_SERVER_PUBLIC_URL=http://127.0.0.1
-      - TIMESKETCH_USERNAME=${TS_ADMIN_USER}
-      - TIMESKETCH_PASSWORD=${TS_ADMIN_PASS}
-    volumes:
-      - ./data:/usr/share/openrelik/data
-    command: "celery --app=src.app worker --task-events --concurrency=2 --loglevel=INFO -Q openrelik-worker-timesketch"
-    networks:
-      - default
-      - timesketch_default
-
-ADDEOF
-fi
-
-cat >> "${OVERRIDE_FILE}" << WORKERSEOF
-  openrelik-worker-hayabusa:
-    container_name: openrelik-worker-hayabusa
-    image: ${OR_HAYABUSA_LOCAL_TAG}
-    restart: always
-    environment:
-      - REDIS_URL=redis://openrelik-redis:6379
-    volumes:
-      - ./data:/usr/share/openrelik/data
-    command: "celery --app=src.app worker --task-events --concurrency=2 --loglevel=INFO -Q openrelik-worker-hayabusa"
-
+  # ── Extra workers ──────────────────────────────────────────────────────────
   openrelik-worker-floss:
     container_name: openrelik-worker-floss
     image: ghcr.io/openrelik/openrelik-worker-floss:${OR_FLOSS_VER}
@@ -819,6 +509,15 @@ cat >> "${OVERRIDE_FILE}" << WORKERSEOF
     restart: always
     volumes:
       - ollama-data:/root/.ollama
+    # GPU: uncomment the deploy block below if the host has an NVIDIA GPU.
+    # Without it, Ollama runs on CPU (slower but functional).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
 
   openrelik-worker-llm:
     container_name: openrelik-worker-llm
@@ -835,12 +534,7 @@ cat >> "${OVERRIDE_FILE}" << WORKERSEOF
 
 volumes:
   ollama-data:
-
-networks:
-  timesketch_default:
-    external: true
-WORKERSEOF
-
+YAMLEOF
 
 log "Validating override schema..."
 docker compose \
@@ -848,25 +542,27 @@ docker compose \
     -f "${OR_COMPOSE_DIR}/docker-compose.override.yml" \
     config --quiet \
     && success "OpenRelik override schema OK." \
-    || error "Override schema invalid - check output above."
+    || error "Override schema invalid — check output above."
 
 success "OpenRelik override written."
 
-
 # =============================================================================
-# SECTION 9 - Apply Overrides + Final Restart
+# SECTION 9 — Apply Overrides + Final Restart
 # =============================================================================
 echo ""
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-echo -e "${CYAN}${BOLD} SECTION 9 - Apply Overrides + Final Restart${NC}"
+echo -e "${CYAN}${BOLD} SECTION 9 — Apply Overrides + Final Restart${NC}"
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-section_desc "Restart Timesketch with network override, restart OpenRelik with workers, verify all healthy"
+section_desc "Restart Timesketch with override · restart OpenRelik with workers · verify all healthy"
 
 compose_up "Restarting Timesketch with network override" "${TS_DIR}" \
     -f docker-compose.yml -f docker-compose.override.yml
 log "Waiting for Timesketch to stabilise..."
 wait_for_healthy "${TS_DIR}" 120
 
+# Pre-remove any named prometheus volumes that may have stale host-path
+# config from a previous install — prevents the interactive
+# "Volume exists but doesn't match configuration. Recreate?" prompt.
 log "Removing stale prometheus volumes (if any)..."
 docker volume rm openrelik_prometheus-data openrelik_prometheus-config 2>/dev/null \
     && log "Stale volumes removed." || log "No stale volumes found."
@@ -876,6 +572,7 @@ compose_up "Restarting OpenRelik with worker override" "${OR_COMPOSE_DIR}" \
 log "Waiting for OpenRelik to stabilise..."
 wait_for_healthy "${OR_COMPOSE_DIR}" 120
 
+# Write startup scripts — both reference the correct override file
 cat > "${TS_DIR}/start.sh" << EOF
 #!/usr/bin/env bash
 # Start Timesketch (with network override for OpenRelik integration)
@@ -886,7 +583,8 @@ chmod +x "${TS_DIR}/start.sh"
 
 cat > "${OR_COMPOSE_DIR}/start.sh" << EOF
 #!/usr/bin/env bash
-# Start OpenRelik (default workers + extra workers)
+# Start OpenRelik (default workers: strings, plaso, timesketch, hayabusa)
+# + extra workers from override: floss, capa, llm + ollama
 cd ${OR_COMPOSE_DIR}
 docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
 EOF
@@ -895,13 +593,86 @@ chmod +x "${OR_COMPOSE_DIR}/start.sh"
 success "Both stacks restarted with overrides."
 
 # =============================================================================
-# SECTION 10 - Health Check + Summary
+# SECTION 10 — Systemd Services (auto-start on reboot)
 # =============================================================================
 echo ""
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-echo -e "${CYAN}${BOLD} SECTION 10 - Health Check + Summary${NC}"
+echo -e "${CYAN}${BOLD} SECTION 10 — Systemd Services${NC}"
 echo -e "${CYAN}${BOLD}======================================================${NC}"
-section_desc "Container status, HTTP checks, DB tables, cleanup"
+section_desc "Write + enable systemd units for Timesketch and OpenRelik · enforce startup order"
+
+# Timesketch unit must start before OpenRelik because:
+#   - openrelik_default network is created by OpenRelik's compose
+#   - timesketch-web must join that network via the override at startup
+#   - if OpenRelik's network doesn't exist yet, the join silently fails
+log "Writing /etc/systemd/system/timesketch.service..."
+cat > /etc/systemd/system/timesketch.service << EOF
+[Unit]
+Description=Timesketch stack
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${TS_DIR}
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.override.yml up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.override.yml down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# OpenRelik unit — After=timesketch.service enforces order.
+# OpenRelik's compose creates the openrelik_default network; only after
+# that network exists can timesketch-web join it. Declaring the dependency
+# here prevents the race condition that causes the UI to be unreachable
+# after a reboot even when both stacks appear to be running.
+log "Writing /etc/systemd/system/openrelik.service..."
+cat > /etc/systemd/system/openrelik.service << EOF
+[Unit]
+Description=OpenRelik stack
+Requires=docker.service
+After=docker.service timesketch.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${OR_COMPOSE_DIR}
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.override.yml up -d --remove-orphans
+ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.override.yml down
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+log "Reloading systemd and enabling services..."
+systemctl daemon-reload
+systemctl enable timesketch.service \
+    && success "timesketch.service enabled." \
+    || warn "Failed to enable timesketch.service."
+systemctl enable openrelik.service \
+    && success "openrelik.service enabled." \
+    || warn "Failed to enable openrelik.service."
+
+log "Verifying services are enabled..."
+systemctl is-enabled timesketch.service \
+    && systemctl is-enabled openrelik.service \
+    && success "Both services will auto-start on reboot." \
+    || warn "One or more services not enabled — check systemctl status."
+
+success "Systemd integration complete."
+
+# =============================================================================
+# SECTION 11 — Health Check + Summary
+# =============================================================================
+echo ""
+echo -e "${CYAN}${BOLD}======================================================${NC}"
+echo -e "${CYAN}${BOLD} SECTION 11 — Health Check + Summary${NC}"
+echo -e "${CYAN}${BOLD}======================================================${NC}"
+section_desc "Container status · HTTP checks · DB tables · cleanup"
 
 echo ""
 log "All running containers:"
@@ -914,17 +685,17 @@ docker ps -a --filter "status=exited" --filter "status=restarting" \
 
 echo ""
 log "Timesketch HTTP (port 80):"
-curl -s -o /dev/null -w "  http://localhost -> HTTP %{http_code}\n" \
+curl -s -o /dev/null -w "  http://localhost → HTTP %{http_code}\n" \
     http://localhost 2>/dev/null || true
 
 echo ""
 log "OpenRelik UI HTTP (port 8711):"
-curl -s -o /dev/null -w "  http://localhost:8711 -> HTTP %{http_code}\n" \
+curl -s -o /dev/null -w "  http://localhost:8711 → HTTP %{http_code}\n" \
     http://localhost:8711 2>/dev/null || true
 
 echo ""
 log "OpenRelik API HTTP (port 8710):"
-curl -s -o /dev/null -w "  http://localhost:8710 -> HTTP %{http_code}\n" \
+curl -s -o /dev/null -w "  http://localhost:8710 → HTTP %{http_code}\n" \
     http://localhost:8710 2>/dev/null || true
 
 echo ""
@@ -955,31 +726,34 @@ echo -e "${GREEN}${BOLD}  DEPLOYMENT COMPLETE${NC}"
 echo -e "${GREEN}${BOLD}============================================================${NC}"
 echo ""
 echo -e "${CYAN}  ACCESS POINTS${NC}"
-echo "  +------------------------------------------------------+"
-echo "  |  Timesketch   http://localhost         (port 80)     |"
-echo "  |  OpenRelik    http://localhost:8711    (UI)          |"
-echo "  |               http://localhost:8710    (API)         |"
-echo "  +------------------------------------------------------+"
+echo "  ┌──────────────────────────────────────────────────────┐"
+echo "  │  Timesketch   http://localhost         (port 80)     │"
+echo "  │  OpenRelik    http://localhost:8711    (UI)          │"
+echo "  │               http://localhost:8710    (API)         │"
+echo "  └──────────────────────────────────────────────────────┘"
 echo ""
 echo -e "${CYAN}  ACCOUNTS${NC}"
-echo "  +------------------------------------------------------+"
-echo "  |  System       Username    Password                   |"
-echo "  |  ------------ ---------   ----------------------     |"
-printf "  |  Timesketch   %-10s %-26s |\n" "${TS_ADMIN_USER}" "${TS_ADMIN_PASS}"
-printf "  |  OpenRelik    %-10s %-26s |\n" "${OR_ADMIN_USER}" "${OR_ADMIN_PASS}"
-echo "  +------------------------------------------------------+"
+echo "  ┌──────────────────────────────────────────────────────┐"
+echo "  │  System       Username    Password                   │"
+echo "  │  ──────────── ─────────   ─────────────────────────  │"
+printf "  │  Timesketch   %-10s %-26s │\n" "${TS_ADMIN_USER}" "${TS_ADMIN_PASS}"
+printf "  │  OpenRelik    %-10s %-26s │\n" "${OR_ADMIN_USER}" "${OR_ADMIN_PASS}"
+echo "  └──────────────────────────────────────────────────────┘"
 echo ""
 echo -e "${CYAN}  WORKERS${NC}"
-echo "  +--------------------------------------------------------------+"
-echo "  |  Base workers/services come from the selected OpenRelik      |"
-echo "  |  release compose.                                            |"
-echo "  |                                                              |"
-echo "  |  Added here via override:                                    |"
-echo "  |    openrelik-worker-floss       (deobfuscated strings)      |"
-echo "  |    openrelik-worker-capa        (binary capabilities/ATT&CK)|"
-echo "  |    openrelik-worker-llm         (LLM prompts via Ollama)    |"
-echo "  |    openrelik-ollama             (Ollama backend, CPU mode)  |"
-echo "  +--------------------------------------------------------------+"
+echo "  ┌──────────────────────────────────────────────────────────────┐"
+echo "  │  Default (ships with OpenRelik 0.7.0)                       │"
+echo "  │    openrelik-worker-strings     (string extraction)         │"
+echo "  │    openrelik-worker-plaso       (super timeline)            │"
+echo "  │    openrelik-worker-hayabusa    (EVTX triage)               │"
+echo "  │    openrelik-worker-timesketch  (pushes to Timesketch)      │"
+echo "  │                                                              │"
+echo "  │  Added via override                                          │"
+echo "  │    openrelik-worker-floss       (deobfuscated strings)      │"
+echo "  │    openrelik-worker-capa        (binary capabilities/ATT&CK)│"
+echo "  │    openrelik-worker-llm         (LLM prompts via Ollama)    │"
+echo "  │    openrelik-ollama             (Ollama backend, CPU mode)  │"
+echo "  └──────────────────────────────────────────────────────────────┘"
 echo ""
 echo -e "${YELLOW}  NOTE: Pull an Ollama model before using the llm worker:${NC}"
 echo "    docker exec openrelik-ollama ollama pull llama3"
@@ -988,9 +762,17 @@ echo -e "${CYAN}  NETWORK INTEGRATION${NC}"
 echo "  timesketch-web is on ${OR_NETWORK}"
 echo "  Workers reach Timesketch at http://timesketch-web:5000"
 echo ""
-echo -e "${CYAN}  STARTUP SCRIPTS (after reboot)${NC}"
-echo "    ${TS_DIR}/start.sh"
-echo "    ${OR_COMPOSE_DIR}/start.sh"
+echo -e "${CYAN}  AUTO-START ON REBOOT (systemd)${NC}"
+echo "  ┌──────────────────────────────────────────────────────┐"
+echo "  │  Both stacks start automatically via systemd         │"
+echo "  │  Order: Timesketch → OpenRelik (enforced by unit)    │"
+echo "  │                                                      │"
+echo "  │  Manual control:                                     │"
+echo "  │    systemctl start timesketch                        │"
+echo "  │    systemctl start openrelik                         │"
+echo "  │    systemctl status timesketch                       │"
+echo "  │    systemctl status openrelik                        │"
+echo "  └──────────────────────────────────────────────────────┘"
 echo ""
 echo -e "${CYAN}  INSTALLATION LOG${NC}"
 echo "    ${LOG_FILE}"
