@@ -1,98 +1,137 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+---
 
-## [## [1.1.0] - 2026-03-08  OpenRelik 0.7.0 support
+## [Current] — Systemd auto-start + OpenRelik 0.7.0
 
 ### Added
 
-- **Systemd services** (`timesketch.service`, `openrelik.service`) written and enabled
-  during install. Both stacks now auto-start on reboot without manual intervention.
-  Startup order is enforced at the unit level (`After=timesketch.service` on the
-  OpenRelik unit), fixing the race condition where OpenRelik's network did not exist
-  when Timesketch tried to join it.
+**Systemd services (Section 10 — new)**
 
-- **floss worker** (`ghcr.io/openrelik/openrelik-worker-floss`) added via override.
-  FLARE Obfuscated String Solver for deobfuscating strings from malware binaries.
+Two systemd unit files are written to `/etc/systemd/system/` and enabled
+during install:
 
-- **capa worker** (`ghcr.io/openrelik/openrelik-worker-capa`) added via override.
-  Detects capabilities in executables and maps findings to ATT&CK techniques.
+- `timesketch.service` — `After=docker.service`. Starts Timesketch first,
+  independently of OpenRelik.
+- `openrelik.service` — `After=docker.service timesketch.service`. Enforces
+  startup order: Docker → Timesketch → OpenRelik.
 
-- **llm worker** (`ghcr.io/openrelik/openrelik-worker-llm`) added via override.
-  Runs user-defined prompts against any UTF-8 readable file using a local Ollama backend.
+Both units use `Type=oneshot` with `RemainAfterExit=yes`, which is the correct
+pattern for `docker compose up -d`. systemd considers the service active after
+the start command exits, so `systemctl status` and stop/restart work correctly.
 
-- **Ollama backend** (`ollama/ollama:latest`) added as `openrelik-ollama` service.
-  Runs in CPU mode by default. GPU block is present but commented out for NVIDIA hosts.
-  Named volume `ollama-data` persists downloaded models across restarts.
+**Why order matters:** OpenRelik's compose creates the `openrelik_default` Docker
+network. The Timesketch override attaches `timesketch-web` to that network at
+startup. If both stacks race on boot (no ordering), the network join silently
+fails — the UI appears to work but the worker-to-Timesketch link is broken.
+This was the root cause of the "page not visible after reboot" issue.
 
-- **Post-download file validation** in Section 4. After the OpenRelik installer runs,
-  the script checks the first line of `docker-compose.yml` and `config.env` for HTTP
-  error body signatures (`404`, `not found`, `error`, `<html>`). If detected,
-  re-downloads using `curl -fsSL` which fails hard on HTTP errors. This catches the
-  failure mode where `curl -s` in the upstream installer silently saves error responses
-  as config files.
+**Summary block updated:**
+- Added `AUTO-START ON REBOOT` box with `systemctl` commands.
+- `start.sh` paths moved to a `STARTUP SCRIPTS (manual fallback)` line.
+- Workers box updated to include `openrelik-worker-hayabusa` in the override list.
+
+---
+
+## [Previous] — OpenRelik 0.7.0 support + resilience overhaul
+
+### Added
+
+- **RC filename resolution** (`patch_openrelik_installer`): injects a
+  `resolve_filename()` function into the upstream installer before running it.
+  This probes for release-candidate variants (`-rc.1` through `-rc.9`) of each
+  versioned config and compose file, so the script does not break when OpenRelik
+  publishes an RC that does not yet have a final filename.
+
+- **Release selection logic** (`resolve_openrelik_release_selection`): reads the
+  installer's own `LATEST_RELEASE` and `RELEASES` arrays to derive the correct
+  numeric menu choice for any target release. Replaces the old hard-coded
+  `echo "1"` stdin pipe, which was sending input to the wrong subprocess and
+  corrupting the install.
+
+- **Post-install file repair** (`repair_openrelik_deploy_file_if_needed`): after
+  the installer runs, validates `config.env` and `docker-compose.yml`. If either
+  is missing, empty, or contains an HTTP error body, tries a prioritised list of
+  candidate filenames (versioned, latest, plain) from the deploy repo URL.
+
+- **Download validation** (`download_first_valid`, `is_http_error_body`): shared
+  helpers used by the repair logic. Rejects files whose first 5 lines match HTML,
+  404, or error signatures. Also rejects config files that still contain
+  `<REPLACE_WITH_...>` placeholders, and compose files missing a `services:` block.
+
+- **Placeholder detection in Section 5**: if `.env` still contains
+  `<REPLACE_WITH_...>` values after the installer and repair logic both run,
+  the script hard-fails with a clear error message rather than starting a broken
+  stack.
+
+- **Dynamic timesketch worker detection in Section 8**: checks whether
+  `openrelik-worker-timesketch` is already defined in the base release compose.
+  If yes: patch mode (merge credentials env vars only). If no: add mode (full
+  service definition including image, volumes, command, and network membership).
+  Makes the override forward-compatible across OpenRelik releases.
+
+- **`timesketch_default` network declared in override**: when the timesketch
+  worker is added in full (add mode), it joins `timesketch_default` as an
+  external network so it can communicate with Timesketch across the compose
+  project boundary.
+
+- **Hayabusa local build**: `openrelik-worker-hayabusa` is cloned from
+  `openrelik-contrib/openrelik-worker-hayabusa` and built locally as
+  `openrelik-worker-hayabusa:local`. Added as a service in the override.
+
+- **Extra workers via override**: `openrelik-worker-floss`, `openrelik-worker-capa`,
+  `openrelik-worker-llm`, and `openrelik-ollama` added as new services in
+  `docker-compose.override.yml`.
+
+- **OpenSearch memory patch in Section 2**: `8GB/8g/8192m` replaced with
+  `4GB/4g/4096m` in the Timesketch installer to allow deployment on hosts
+  with less than 16 GB RAM.
+
+- **Carriage-return strip in Section 4**: the upstream installer is passed through
+  `python3` to strip `\r\n` line endings before patching, preventing sed/grep
+  failures on Windows-style line endings.
+
+- **`POSTGRES_USER` / `POSTGRES_DB` extracted from `.env` in Section 5**:
+  replaces the previous hardcoded fallback values so these are always read from
+  the actual generated config.
+
+- **`RUNNING_COUNT` now uses `awk`** instead of `grep -c`, which avoids the
+  non-zero exit code `grep -c` returns when there are no matches (caused silent
+  failures with `set -e`).
 
 ### Changed
 
-- **OpenRelik installer stdin pipe removed.** The previous script piped `echo "1"` into
-  the installer under the assumption it had a stable/dev menu prompt. The current
-  installer has no such prompt; the piped input was reaching `docker compose` subprocess
-  stdin and corrupting interactive volume-recreation prompts, which caused the 404 config
-  file saves. The installer now runs with no stdin input.
+- **`OR_TARGET_RELEASE` variable** replaces the old `echo "1"` stdin pipe.
+  Set to `"0.7.0"` by default. Change to `"latest"` or another version string
+  to target a different release.
 
-- **Hayabusa no longer built locally.** The worker has moved from `openrelik-contrib`
-  to the official `openrelik` org and now ships as a pre-built image in the default
-  OpenRelik 0.7.0 `docker-compose.yml`. The previous clone of
-  `openrelik-contrib/openrelik-worker-hayabusa` and 5–15 minute `docker build` are
-  removed entirely.
+- **Section 4 description updated** to reflect installer patching and release
+  selection logic.
 
-- **Worker override strategy changed.** Previously the override added both
-  `openrelik-worker-timesketch` and `openrelik-worker-hayabusa` as new services.
-  Since both now ship in the default 0.7.0 compose, the override only patches the
-  existing `openrelik-worker-timesketch` service by merging the four missing Timesketch
-  credential env vars. No service definitions are duplicated.
-
-- **`OR_HAYABUSA_DIR` and `OR_HAYABUSA_IMAGE` config variables removed.** No longer
-  needed with the official image approach.
-
-- **Cleanup section** no longer removes `/opt/openrelik-worker-hayabusa`.
-
-- **Summary block** startup section replaced: `start.sh` paths removed, replaced with
-  `systemctl` commands and a note that startup is automatic.
-
-- **Section count**: 10 sections → 11 sections (Section 10 is the new systemd section;
+- **Section count**: 10 sections → 11 sections (new Section 10 is systemd;
   old Section 10 health check is now Section 11).
 
-- **Script header** updated to reflect 0.7.0, correct worker list, and new override
-  strategy.
+---
 
+## [Original] — OpenRelik 0.6.0 baseline
 
-## [1.0.1] - 2026-03-08
+### Stack
 
-### Added
+- Timesketch via official Google installer.
+- OpenRelik via official installer with `echo "1"` stdin pipe (broken — see above).
+- No hayabusa worker (added in subsequent version via `openrelik-contrib` build).
+- No floss, capa, or llm workers.
+- No systemd integration — stacks required manual `start.sh` after every reboot.
+- No RC filename resolution or post-install file repair.
+- `RUNNING_COUNT` used `grep -c` (could exit non-zero with `set -e`).
+- OpenSearch memory requirement not patched (required 16 GB+ host).
 
-- **Release selection and file repair:** Installer now automatically selects the correct OpenRelik release (default `0.7.0`) from the upstream `install.sh` menu instead of piping `1` blindly. It also validates and, if needed, re-downloads `config.env` and `docker-compose.yml` using versioned filenames when HTML error bodies are saved.
-- **Extra workers via override:** Added support for FLOSS, CAPA, and LLM workers through `docker-compose.override.yml`, alongside a local `openrelik-ollama` service. Pull an Ollama model (`llama3`) after deployment to enable the LLM worker.
-- **Timesketch worker patch:** Script patches the existing `openrelik-worker-timesketch` service with correct Timesketch URL and credentials rather than redefining the entire service in override.
-- **Persistent network integration:** Timesketch override now makes `timesketch-web` permanently join `openrelik_default`, eliminating manual `docker network connect` after reboots.
-- **Health checks and helper functions:** Added helper functions (`wait_for_healthy`, `wait_for_postgres`, `compose_up`) and improved logging for readiness and Compose operations.
-- **Deterministic startup scripts:** Script writes `/opt/timesketch/start.sh` and `/opt/openrelik/<compose-dir>/start.sh` to include overrides during startup.
+### Known issues at this version
 
-### Changed
-
-- **Script name:** Installer renamed to `install_stack.sh` (from `Install_Stack.sh`) for consistency.
-- **Removed Hayabusa build step:** No longer clones/builds `openrelik-worker-hayabusa` locally. OpenRelik `0.7.0` includes Hayabusa by default.
-- **Readability improvements:** README rewritten to clarify purpose, workflow, warnings, and worker behavior.
-- **Cleaner cleanup:** Removed deletion of the Hayabusa build directory; cleanup still removes all containers, volumes, and custom networks.
-
-### Fixed
-
-- **Installer hang from menu mismatch:** Previously piping `1` could fail when release ordering changed. New logic derives the correct menu option for the target release.
-- **Invalid fallback download names:** When upstream download failed, script now uses versioned filenames instead of unversioned names that return `404`.
-
-## [1.0.0] - Initial release
-
-- Initial version of full-stack installer combining Timesketch, OpenRelik, and a locally built Hayabusa worker.
-- Set up network integration and Docker Compose overrides for Timesketch and Hayabusa workers.
-- Included destructive cleanup logic and health checks.
+- `echo "1" | bash installer.sh` sent stdin to `docker compose` subprocesses
+  inside the installer, causing interactive prompts to auto-answer destructively.
+  Manifested as `curl -s` saving HTTP 404 error bodies as `docker-compose.yml`
+  and `config.env`, which broke compose validation with:
+  `non-string key at top level: 404`.
+- No auto-start on reboot.
+- No resilience against upstream filename changes or RC releases.
