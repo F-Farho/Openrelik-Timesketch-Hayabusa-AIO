@@ -1,60 +1,35 @@
-# OpenRelik + Timesketch Full-Stack Installer
+# install_stack.sh
 
-This repository provides a single automation script, `install_stack.sh`, that deploys and integrates:
+Full-stack installer for **Timesketch + OpenRelik 0.7.0** on a single Linux host using Docker Compose.
 
-- **Timesketch** — forensic timeline analysis platform
-- **OpenRelik** (release `0.7.0` or latest) — automated forensic processing and reporting
-- A suite of OpenRelik workers, including optional **FLOSS**, **CAPA**, and **LLM** workers powered by **Ollama**
+---
 
-The script installs both platforms with Docker Compose, configures Timesketch and OpenRelik to communicate, and writes Docker Compose overrides to attach extra workers without modifying upstream Compose files.
+## What it installs
 
-## Why this installer exists
+| Component | Version | Notes |
+|---|---|---|
+| Timesketch | latest (official installer) | nginx on :80, API on :5000 (internal) |
+| OpenRelik | 0.7.0 | UI on :8711, API on :8710 |
+| openrelik-worker-strings | default | Ships with OpenRelik 0.7.0 |
+| openrelik-worker-plaso | default | Ships with OpenRelik 0.7.0 |
+| openrelik-worker-hayabusa | default | Ships with OpenRelik 0.7.0 |
+| openrelik-worker-timesketch | default + patched | Ships with OpenRelik 0.7.0; credentials injected via override |
+| openrelik-worker-floss | latest | Added via override |
+| openrelik-worker-capa | latest | Added via override |
+| openrelik-worker-llm | latest | Added via override |
+| openrelik-ollama | latest (CPU mode) | Added via override; LLM backend for llm worker |
 
-By default, OpenRelik and Timesketch are separate deployments:
-
-- Standard OpenRelik deployment does not include Timesketch and usually ships only a core worker set.
-- Timesketch has no built-in awareness of OpenRelik.
-
-This script bridges that gap by:
-
-1. Installing Timesketch and OpenRelik under `/opt` with flat directory structures.
-2. Patching the built-in `openrelik-worker-timesketch` service with Timesketch credentials and URLs.
-3. Adding extra workers (FLOSS, CAPA, and an LLM worker) via `docker-compose.override.yml` so they persist across restarts.
-4. Connecting the `timesketch-web` container to the OpenRelik internal network (`openrelik_default`) so workers can reach Timesketch at `http://timesketch-web:5000`.
-5. Selecting the correct OpenRelik release (`0.7.0` by default) and repairing deployment files if the installer downloads HTML error bodies.
-
-## What the script does
-
-`install_stack.sh` runs this end-to-end workflow:
-
-1. Cleans previous Docker containers, volumes, networks, and prior install directories (**destructive reset** — use a dedicated host).
-2. Downloads and runs the Timesketch installer from Google, patches health-check timeout, creates data directories, and starts the Timesketch stack.
-3. Creates a Timesketch admin account (`admin` / `admin1234` by default).
-4. Downloads and runs the OpenRelik installer, automatically selecting the correct release menu option (`0.7.0` by default, or latest if configured), and captures the generated admin password.
-5. Verifies the OpenRelik stack, ensures `.env` is complete, waits for PostgreSQL readiness and DB migrations, and validates Compose schema.
-6. Writes a Timesketch Docker Compose override to attach `timesketch-web` to OpenRelik’s internal network.
-7. Writes an OpenRelik Docker Compose override that:
-   - Patches `openrelik-worker-timesketch` with Timesketch URL and credentials.
-   - Adds FLOSS (`openrelik-worker-floss`), CAPA (`openrelik-worker-capa`), and LLM (`openrelik-worker-llm` + `openrelik-ollama`) services.
-8. Restarts both stacks with overrides and prints a deployment summary, including access URLs and credentials.
-
-## Important warnings
-
-- **Destructive cleanup:** The script stops and removes all Docker containers, volumes, custom networks, and prunes Docker system cache before deployment.
-- **Root required:** Run with `sudo` or as root.
-- **Default credentials in script:** Timesketch defaults are hard-coded (`admin` / `admin1234`). Change credentials after deployment.
-- **Release selection:** Defaults to OpenRelik `0.7.0`. You can change `OR_TARGET_RELEASE` at the top of the script.
-- **LLM worker setup:** Pull an Ollama model after installation:
-
-```bash
-docker exec openrelik-ollama ollama pull llama3
-```
+---
 
 ## Requirements
 
-- Linux host with Docker Engine and Docker Compose plugin
-- Internet access to download installer scripts and images
-- Sufficient CPU / RAM / disk for Timesketch, OpenRelik, and additional workers
+- Ubuntu 22.04 or 24.04
+- Docker Engine + Docker Compose v2
+- Root access (`sudo`)
+- Outbound internet (GitHub, ghcr.io, docker.io)
+- Minimum 16 GB RAM recommended (OpenSearch alone needs 8 GB)
+
+---
 
 ## Usage
 
@@ -62,51 +37,126 @@ docker exec openrelik-ollama ollama pull llama3
 sudo bash install_stack.sh
 ```
 
-## Default access endpoints
+The script is fully unattended. It will:
 
-- Timesketch: <http://localhost> (port 80)
-- OpenRelik UI: <http://localhost:8711>
-- OpenRelik API: <http://localhost:8710>
+1. Stop and remove all existing containers, volumes, networks, and images
+2. Install Timesketch from the official Google installer
+3. Install OpenRelik using the official installer
+4. Validate all downloaded config files (guards against silent 404 saves)
+5. Connect Timesketch into OpenRelik's Docker network
+6. Patch the Timesketch worker with credentials and add floss, capa, llm workers
+7. Register both stacks as systemd services with correct startup ordering
+8. Run a health check and print a summary
 
-After deployment, the script writes startup helper scripts:
+Full output is captured in `/opt/install_stack_<timestamp>.log`.
 
-- `/opt/timesketch/start.sh`
-- `/opt/openrelik/<compose-dir>/start.sh`
+---
 
-## Additional workers
+## Access
 
-OpenRelik `0.7.0` includes several built-in workers such as strings, plaso, timesketch, and hayabusa.
-This installer adds the following via override:
+| Service | URL | Default credentials |
+|---|---|---|
+| Timesketch | http://localhost | admin / admin1234 |
+| OpenRelik UI | http://localhost:8711 | admin / (generated, shown in summary) |
+| OpenRelik API | http://localhost:8710 | — |
 
-| Worker | Description |
+---
+
+## After install: LLM worker
+
+The `openrelik-worker-llm` container starts in CPU mode with no model loaded.
+Pull a model before using it:
+
+```bash
+docker exec openrelik-ollama ollama pull llama3
+```
+
+To enable GPU acceleration, uncomment the `deploy` block in
+`/opt/openrelik/docker-compose.override.yml` and restart:
+
+```bash
+systemctl restart openrelik
+```
+
+---
+
+## File layout
+
+```
+/opt/timesketch/
+  docker-compose.yml            # official, unmodified
+  docker-compose.override.yml   # connects timesketch-web to openrelik_default network
+  config.env
+  start.sh                      # convenience script (systemd is the primary method)
+
+/opt/openrelik/
+  docker-compose.yml            # official, unmodified
+  docker-compose.override.yml   # patches timesketch worker + adds floss, capa, llm
+  config.env → .env (symlink)
+  start.sh                      # convenience script (systemd is the primary method)
+
+/etc/systemd/system/
+  timesketch.service
+  openrelik.service
+
+/opt/install_stack_<timestamp>.log
+```
+
+---
+
+## Auto-start on reboot
+
+Both stacks are registered as systemd services and start automatically after reboot.
+Startup order is enforced: Timesketch always starts before OpenRelik.
+
+```bash
+# Manual control
+systemctl start timesketch
+systemctl start openrelik
+
+systemctl stop openrelik
+systemctl stop timesketch
+
+systemctl status timesketch
+systemctl status openrelik
+```
+
+---
+
+## Network integration
+
+`timesketch-web` is attached to both its own default network and `openrelik_default`.
+This allows all OpenRelik workers to reach Timesketch at `http://timesketch-web:5000`
+via Docker internal DNS — without exposing any additional ports.
+
+---
+
+## Workers
+
+### Default (ships with OpenRelik 0.7.0)
+
+| Worker | Purpose |
 |---|---|
-| `openrelik-worker-floss` | FLARE Obfuscated String Solver (malware strings) |
-| `openrelik-worker-capa` | Binary capability detection with ATT&CK mapping |
-| `openrelik-worker-llm` | Runs prompts over files via the Ollama backend |
-| `openrelik-ollama` | Local Ollama service used by the LLM worker |
+| openrelik-worker-strings | Extracts plain strings from any file |
+| openrelik-worker-plaso | Generates super timelines from disk images |
+| openrelik-worker-hayabusa | Fast EVTX triage and threat hunting |
+| openrelik-worker-timesketch | Pushes Plaso/CSV timelines into Timesketch |
 
-You can disable any of these by removing the corresponding service from `docker-compose.override.yml` after installation.
+### Added via override
 
-## Logging
+| Worker | Purpose |
+|---|---|
+| openrelik-worker-floss | FLARE Obfuscated String Solver — deobfuscates strings from malware |
+| openrelik-worker-capa | Detects binary capabilities and maps them to ATT&CK techniques |
+| openrelik-worker-llm | Runs user-defined prompts against any UTF-8 file via Ollama |
+| openrelik-ollama | Local Ollama LLM backend (CPU by default, GPU optional) |
 
-Installation output is logged to:
+---
 
-- `/opt/install_stack_<timestamp>.log`
+## Known limitations
 
-## Repository contents
-
-- `install_stack.sh` — main full-stack installer and integration workflow
-- `README.md` — project documentation
-- `CHANGELOG.md` — release history and change log
-- `LICENSE` — repository license
-
-## License
-
-This repository is licensed under the MIT License. See `LICENSE`.
-
-Upstream projects installed by the script are licensed separately. See `THIRD_PARTY_LICENSES.md` for pointers.
-
-## Credits
-
-- Maintainer: Farah Farho ([@F-Farho](https://github.com/F-Farho))
-- Script design and integration: Farah Farho
+- The `openrelik-worker-timesketch` repository is archived upstream. The worker still
+  functions with 0.7.0 but receives no further updates.
+- Ollama runs in CPU mode by default. Large models will be slow without a GPU.
+- Timesketch credentials are hardcoded in the script (`admin / admin1234`).
+  Change them in the configuration block at the top of `install_stack.sh` before running.
