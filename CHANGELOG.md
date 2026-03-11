@@ -1,39 +1,7 @@
 # Changelog
 
 ---
-
-## [Current] — Systemd auto-start + OpenRelik 0.7.0
-
-### Added
-
-**Systemd services (Section 10 — new)**
-
-Two systemd unit files are written to `/etc/systemd/system/` and enabled
-during install:
-
-- `timesketch.service` — `After=docker.service`. Starts Timesketch first,
-  independently of OpenRelik.
-- `openrelik.service` — `After=docker.service timesketch.service`. Enforces
-  startup order: Docker → Timesketch → OpenRelik.
-
-Both units use `Type=oneshot` with `RemainAfterExit=yes`, which is the correct
-pattern for `docker compose up -d`. systemd considers the service active after
-the start command exits, so `systemctl status` and stop/restart work correctly.
-
-**Why order matters:** OpenRelik's compose creates the `openrelik_default` Docker
-network. The Timesketch override attaches `timesketch-web` to that network at
-startup. If both stacks race on boot (no ordering), the network join silently
-fails — the UI appears to work but the worker-to-Timesketch link is broken.
-This was the root cause of the "page not visible after reboot" issue.
-
-**Summary block updated:**
-- Added `AUTO-START ON REBOOT` box with `systemctl` commands.
-- `start.sh` paths moved to a `STARTUP SCRIPTS (manual fallback)` line.
-- Workers box updated to include `openrelik-worker-hayabusa` in the override list.
-
----
-
-## [Previous] — OpenRelik 0.7.0 support + resilience overhaul
+## [Current] — OpenRelik 0.7.0 support + resilience overhaul
 
 ### Added
 
